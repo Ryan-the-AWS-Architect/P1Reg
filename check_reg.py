@@ -1,68 +1,176 @@
+import hashlib
+import json
 import os
 import re
+from pathlib import Path
+
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://www.playeroneservices.com/registration"
-WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+REGISTRATION_URL = "https://www.playeroneservices.com/registration"
+WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
 
-response = requests.get(
-    URL,
-    headers={
-        "User-Agent": "Mozilla/5.0 Player1RegistrationMonitor"
-    },
-    timeout=30,
-)
+STATE_FILE = Path("p1s_state.json")
 
-response.raise_for_status()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 P1S Registration Monitor"
+}
 
-soup = BeautifulSoup(response.text, "html.parser")
 
-# Get the visible text from the registration page.
-text = soup.get_text(" ", strip=True)
+def get_page():
+    response = requests.get(
+        REGISTRATION_URL,
+        headers=HEADERS,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.text
 
-# Look for registration-related content.
-registration_keywords = [
-    "register",
-    "registration",
-    "secure your registration",
-]
 
-found = []
+def clean_text(value):
+    return re.sub(r"\s+", " ", value).strip()
 
-for keyword in registration_keywords:
-    if keyword.lower() in text.lower():
-        found.append(keyword)
 
-# Save a simplified representation of the page.
-state = re.sub(r"\s+", " ", text).strip()
+def get_events(html):
+    soup = BeautifulSoup(html, "html.parser")
 
-# GitHub Actions provides this file between runs.
-state_file = "previous_state.txt"
+    events = []
 
-previous = ""
+    # Squarespace pages generally expose event/product titles
+    # as headings or links. We collect likely event blocks.
+    for element in soup.find_all(["h2", "h3", "h4", "article"]):
+        text = clean_text(element.get_text(" ", strip=True))
 
-if os.path.exists(state_file):
-    with open(state_file, "r", encoding="utf-8") as f:
-        previous = f.read()
+        if not text:
+            continue
 
-# Only alert when the page has changed.
-if previous and state != previous:
-    message = (
-        "🚨 **P1S registration page changed!**\n\n"
-        f"{URL}\n\n"
-        "Check the registration page for newly opened events."
+        # Ignore generic page headings.
+        if text.lower() in {
+            "registration",
+            "filters",
+            "filter",
+            "no results found",
+        }:
+            continue
+
+        # Event listings generally contain a date.
+        if re.search(
+            r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}",
+            text,
+            re.IGNORECASE,
+        ):
+            events.append(text)
+
+    # Remove duplicates while preserving order.
+    unique_events = []
+    seen = set()
+
+    for event in events:
+        if event not in seen:
+            seen.add(event)
+            unique_events.append(event)
+
+    return unique_events
+
+
+def get_state(events):
+    normalized = json.dumps(
+        events,
+        sort_keys=True,
+        ensure_ascii=False,
     )
 
-    result = requests.post(
-        WEBHOOK,
+    return {
+        "hash": hashlib.sha256(
+            normalized.encode("utf-8")
+        ).hexdigest(),
+        "events": events,
+    }
+
+
+def send_discord(message):
+    response = requests.post(
+        WEBHOOK_URL,
         json={
-            "content": message
+            "content": message,
+            "allowed_mentions": {
+                "parse": ["everyone", "roles"]
+            },
         },
         timeout=30,
     )
 
-    result.raise_for_status()
+    response.raise_for_status()
 
-with open(state_file, "w", encoding="utf-8") as f:
-    f.write(state)
+
+def main():
+    html = get_page()
+    events = get_events(html)
+
+    current_state = get_state(events)
+
+    # TEST_MODE lets us verify Discord without waiting for a change.
+    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
+
+    if test_mode:
+        send_discord(
+            "🧪 **P1S registration monitor test**\n\n"
+            "Discord alerts are working correctly.\n\n"
+            f"Monitoring: {REGISTRATION_URL}"
+        )
+
+        print("P1S test message sent.")
+        return
+
+    previous_state = None
+
+    if STATE_FILE.exists():
+        try:
+            previous_state = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError:
+            previous_state = None
+
+    if previous_state is None:
+        # First run establishes the baseline.
+        print("P1S baseline created. No alert sent.")
+
+    elif current_state["hash"] != previous_state.get("hash"):
+        old_events = set(previous_state.get("events", []))
+        new_events = [
+            event
+            for event in events
+            if event not in old_events
+        ]
+
+        if new_events:
+            message = (
+                "🚨 **P1S REGISTRATION UPDATE**\n\n"
+                "New registration listing detected:\n\n"
+            )
+
+            for event in new_events:
+                message += f"• **{event}**\n"
+
+            message += (
+                f"\n🔗 {REGISTRATION_URL}"
+            )
+
+            send_discord(message)
+            print("P1S Discord alert sent.")
+
+        else:
+            print(
+                "P1S page changed, but no new event listing "
+                "was detected."
+            )
+
+    STATE_FILE.write_text(
+        json.dumps(current_state, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    main()
