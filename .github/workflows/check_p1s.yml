@@ -1,4 +1,4 @@
-name: Check P1 Reg
+name: P1S Registration Monitor
 
 on:
   schedule:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout P1S monitor
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,16 +25,20 @@ jobs:
         run: |
           pip install requests beautifulsoup4
 
-      - name: Check registration page
+      - name: Check P1S registration
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python check_reg.py
 
-      - name: Save previous page state
+      - name: Save P1S state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add previous_state.txt
-          git diff --cached --quiet || git commit -m "Update registration state"
+
+          git add p1s_state.json
+
+          git diff --cached --quiet || \
+            git commit -m "Update P1S registration state"
+
           git push
