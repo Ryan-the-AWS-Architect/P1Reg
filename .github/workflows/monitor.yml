@@ -1,0 +1,60 @@
+name: Registration Monitor
+
+on:
+  schedule:
+    # Runs every 15 minutes.
+    - cron: "*/15 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Send Discord test messages instead of checking for changes"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      STORE_P1S_NAME: ${{ secrets.STORE_P1S_NAME }}
+      STORE_PGG_NAME: ${{ secrets.STORE_PGG_NAME }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run registration monitor
+        env:
+          TEST_MODE: ${{ inputs.test_mode }}
+        run: |
+          python check_reg.py
+
+      - name: Commit updated state files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add p1s_state.json pgg_state.json
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Update registration monitor state"
+            git push
+          fi
