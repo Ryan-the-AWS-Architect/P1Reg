@@ -36,12 +36,19 @@ SOURCES = {
 
 
 def clean_text(value):
-    """Normalize whitespace in scraped text."""
     return re.sub(r"\s+", " ", value).strip()
 
 
+def truncate_text(text, max_length):
+    text = clean_text(text)
+
+    if len(text) <= max_length:
+        return text
+
+    return text[: max_length - 1].rstrip() + "…"
+
+
 def get_page(url):
-    """Download a page and return its HTML."""
     response = requests.get(
         url,
         headers=HEADERS,
@@ -60,18 +67,12 @@ def get_page(url):
 def parse_p1s(html):
     """
     Parse Player One Services registration listings.
-
-    Returns a list of structured events rather than one giant block of text.
     """
 
     soup = BeautifulSoup(html, "html.parser")
 
     events = []
 
-    # Find elements containing date patterns such as:
-    # Sep. 25th
-    # Sep 25th
-    # September 25th
     date_pattern = re.compile(
         r"\b("
         r"Jan(?:uary)?|"
@@ -86,11 +87,10 @@ def parse_p1s(html):
         r"Oct(?:ober)?|"
         r"Nov(?:ember)?|"
         r"Dec(?:ember)?"
-        r")\.?\s+\d{1,2}(?:st|nd|rd|th)?"
+        r")\.?\s+\d{1,2}(?:st|nd|rd|th)?",
+        re.IGNORECASE,
     )
 
-    # The registration page currently exposes the individual registrations
-    # through article-like containers.
     candidates = soup.find_all(
         ["article", "h2", "h3", "h4"]
     )
@@ -106,12 +106,9 @@ def parse_p1s(html):
         if not text:
             continue
 
-        match = date_pattern.search(text)
-
-        if not match:
+        if not date_pattern.search(text):
             continue
 
-        # Ignore generic filter/navigation content.
         lower_text = text.lower()
 
         if "no results found" in lower_text:
@@ -123,21 +120,22 @@ def parse_p1s(html):
         if "clear filters" in lower_text:
             continue
 
-        if lower_text.startswith("registration"):
-            # The page can include the word "Registration" in a wrapper
-            # around the actual event. We still try to extract the event.
-            text = re.sub(
-                r"^registration\s+",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            )
+        text = re.sub(
+            r"^registration\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
 
-        # Try to split:
-        #
-        # Sep. 25th - TCG Standard League
-        #
-        # into date and title.
+        # Remove duplicate filter/navigation text if it occurs inside
+        # the scraped element.
+        text = re.sub(
+            r"registration\s+registration\s+",
+            "Registration ",
+            text,
+            flags=re.IGNORECASE,
+        )
+
         event_match = re.match(
             r"^(?P<date>.+?)\s*-\s*(?P<title>.+?)(?:\s+(?P<body>Secure your registration.*))?$",
             text,
@@ -158,18 +156,22 @@ def parse_p1s(html):
             )
 
         else:
+            date_match = date_pattern.search(text)
+
+            if not date_match:
+                continue
+
             date = clean_text(
-                match.group(0)
+                date_match.group(0)
             )
 
             remainder = clean_text(
-                text[match.end():]
+                text[date_match.end():]
             )
 
             title = remainder
             body = ""
 
-        # Pull price from the text.
         price_match = re.search(
             r"\$\d+(?:\.\d{2})?",
             text,
@@ -181,7 +183,6 @@ def parse_p1s(html):
             else None
         )
 
-        # Remove price from description/title if it was included.
         if price:
             body = clean_text(
                 body.replace(price, "")
@@ -197,7 +198,6 @@ def parse_p1s(html):
             "price": price,
         }
 
-        # Avoid duplicate entries.
         if event not in events:
             events.append(event)
 
@@ -210,18 +210,13 @@ def parse_p1s(html):
 
 def parse_pgg(html):
     """
-    Initial parser for Paradise Games & Gifts.
+    Initial parser for the Paradise Games & Gifts page.
 
-    The PGG page has a different structure from P1S, so we keep its parser
-    separate. This version extracts likely listing blocks without allowing
-    navigation/filter text to become an event.
-
-    We can tighten the selectors after seeing the first real scrape.
+    PGG uses a different page structure from P1S, so it has its own parser.
     """
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove obvious non-content elements.
     for element in soup.find_all(
         [
             "script",
@@ -237,7 +232,6 @@ def parse_pgg(html):
 
     events = []
 
-    # Prefer headings followed by nearby content.
     headings = soup.find_all(
         [
             "h1",
@@ -262,7 +256,6 @@ def parse_pgg(html):
 
         lower_title = title.lower()
 
-        # Skip generic page headings.
         if lower_title in {
             "home",
             "about",
@@ -275,11 +268,9 @@ def parse_pgg(html):
         }:
             continue
 
-        # Ignore tiny/navigation headings.
         if len(title) < 4:
             continue
 
-        # Look for nearby content.
         description = ""
 
         sibling = heading.find_next_sibling()
@@ -315,10 +306,7 @@ def parse_pgg(html):
             }
         )
 
-    # Remove duplicates while preserving order.
-    events = remove_duplicate_events(events)
-
-    return events
+    return remove_duplicate_events(events)
 
 
 # ---------------------------------------------------------------------------
@@ -343,16 +331,14 @@ def parse_source(source_id, html):
 
 
 # ---------------------------------------------------------------------------
-# STATE MANAGEMENT
+# STATE
 # ---------------------------------------------------------------------------
 
 def normalize_event(event):
-    """
-    Convert an event into a stable JSON representation.
-    """
-
     return {
-        "date": event.get("date"),
+        "date": clean_text(
+            event.get("date") or ""
+        ),
         "title": clean_text(
             event.get("title") or ""
         ),
@@ -364,10 +350,6 @@ def normalize_event(event):
 
 
 def get_state(events):
-    """
-    Create a stable state object and hash.
-    """
-
     normalized_events = [
         normalize_event(event)
         for event in events
@@ -432,9 +414,8 @@ def save_state(state_file, state):
 
 def get_display_name(source_id, source):
     """
-    Get the human-readable store name from GitHub Actions secrets.
-
-    The full name is deliberately NOT stored in the repository.
+    Human-readable names are supplied through GitHub Secrets.
+    They are deliberately not stored in the public repository.
     """
 
     env_name = source["display_name_env"]
@@ -455,10 +436,6 @@ def send_discord_embed(
     source,
     new_events,
 ):
-    """
-    Send a nicely formatted Discord embed.
-    """
-
     display_name = get_display_name(
         source_id,
         source,
@@ -466,7 +443,7 @@ def send_discord_embed(
 
     fields = []
 
-    for event in new_events:
+    for event in new_events[:25]:
         date = event.get("date")
         title = event.get("title")
         description = event.get("description")
@@ -483,6 +460,9 @@ def send_discord_embed(
         heading = " — ".join(
             heading_parts
         )
+
+        if not heading:
+            heading = "New Listing"
 
         value_parts = []
 
@@ -511,10 +491,6 @@ def send_discord_embed(
             }
         )
 
-    # Discord allows up to 25 embed fields.
-    # Limit this alert to the first 25 new listings.
-    fields = fields[:25]
-
     payload = {
         "embeds": [
             {
@@ -529,9 +505,7 @@ def send_discord_embed(
                 "color": 15158332,
                 "fields": fields,
                 "footer": {
-                    "text": (
-                        f"Source: {source_id}"
-                    )
+                    "text": f"Source: {source_id}"
                 },
                 "url": source["url"],
             }
@@ -604,10 +578,6 @@ def send_test_message(
 # ---------------------------------------------------------------------------
 
 def event_key(event):
-    """
-    Create a stable key used to identify an event.
-    """
-
     normalized = normalize_event(event)
 
     return json.dumps(
@@ -651,23 +621,7 @@ def remove_duplicate_events(events):
 
 
 # ---------------------------------------------------------------------------
-# UTILITIES
-# ---------------------------------------------------------------------------
-
-def truncate_text(text, max_length):
-    text = clean_text(text)
-
-    if len(text) <= max_length:
-        return text
-
-    return (
-        text[: max_length - 1].rstrip()
-        + "…"
-    )
-
-
-# ---------------------------------------------------------------------------
-# SOURCE CHECKING
+# CHECKING
 # ---------------------------------------------------------------------------
 
 def check_source(
@@ -695,10 +649,10 @@ def check_source(
     )
 
     # Print parsed events to the Actions log.
-    # This will be useful while tuning the PGG parser.
+    # Useful for tuning the PGG parser.
     for event in events:
         print(
-            f"  - "
+            "  - "
             f"{event.get('date') or ''} "
             f"{event.get('title') or ''} "
             f"{event.get('price') or ''}"
@@ -724,7 +678,7 @@ def check_source(
         source["state_file"]
     )
 
-    # First run: establish baseline.
+    # First run creates a baseline.
     if previous_state is None:
         save_state(
             source["state_file"],
@@ -757,8 +711,7 @@ def check_source(
 
         print(
             f"{source_id}: sent Discord alert "
-            f"for {len(new_events)} "
-            "new item(s)."
+            f"for {len(new_events)} new item(s)."
         )
 
     elif (
@@ -808,7 +761,7 @@ def main():
                 f"{source_id}: {exc}"
             )
 
-            # Do not let one broken source
+            # A failure on one source should not
             # prevent the other source from running.
             continue
 
